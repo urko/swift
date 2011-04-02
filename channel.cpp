@@ -101,8 +101,8 @@ void    swift::Loop (tint till) {
 
 
 
-int      swift::Open (const char* filename, const Sha1Hash& hash) {
-    FileTransfer* ft = new FileTransfer(filename, hash);
+int      swift::Open (const char* filename, const Sha1Hash& hash, uint64_t range) {
+    FileTransfer* ft = new FileTransfer(filename, hash, range);
     if (ft && ft->file().file_descriptor()) {
 
         /*if (FileTransfer::files.size()<fdes)  // FIXME duplication
@@ -127,9 +127,20 @@ void    swift::Close (int fd) {
         delete FileTransfer::files[fd];
 }
 
-
-void    swift::AddPeer (Address address, const Sha1Hash& root) {
+void    swift::AddPeer (const Address& address, const Sha1Hash& root) {
     Channel::peer_selector->AddPeer(address,root);
+}
+
+void    swift::AddPeers (PeerList* peerList, const Sha1Hash& root) {
+    Channel::peer_selector->AddPeers(peerList, root);
+}
+
+Address*	swift::GetPeer (const Sha1Hash& for_root) {
+    Channel::peer_selector->GetPeers(for_root);
+}
+
+PeerList*	swift::GetPeers (const Sha1Hash& for_root) {
+    Channel::peer_selector->GetPeers(for_root);
 }
 
 

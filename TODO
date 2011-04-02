@@ -60,6 +60,13 @@ MFOLD
 * integrate multi-peer changes by Jori
 * do global swarm stats
 
+HTTPGW
+* Change swift::SeqComplete by a byte-range query method
+* Avoid pread method or assure the desired bytes are cached properly
+* Set the suitable Content-Type in the http header
+* Allow http pipelining
+* Websockets?
+
 OTHER
 * httpgw or nginx?
 * Sha1Hash constructor ambiguity

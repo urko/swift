@@ -9,7 +9,7 @@ enum {
     HTTPGW_MAX_HEADER=1
 };
 const char * HTTPGW_HEADERS[HTTPGW_MAX_HEADER] = {
-    "Content-Range"
+    "Range"
 };
 
 
@@ -55,17 +55,28 @@ void HttpGwCloseConnection (SOCKET sock) {
 
 void HttpGwMayWriteCallback (SOCKET sink) {
     http_gw_t* req = HttpGwFindRequest(sink);
+    /* The number of bytes completed sequentially, i.e. from the beginning of
+    the file, uninterrupted. */
+    // FIXME Replace this method by another one that returns true if the byte range is in the buffer
     uint64_t complete = swift::SeqComplete(req->transfer);
-    if (complete>req->offset) { // send data
-        char buf[1<<12];
-        uint64_t tosend = std::min((uint64_t)1<<12,complete-req->offset);
-        size_t rd = pread(req->transfer,buf,tosend,req->offset); // hope it is cached
+    // Check if there is still bytes to send
+    if (req->tosend && (req->offset < complete)) { // send data
+        char buf[1<<12];	// FIXME 4096. Increase this value?
+        uint64_t endRange = req->offset+req->tosend;
+        // Send at most 2<<12 (4096) bytes
+        uint64_t tosend = (endRange <= complete) ? std::min((uint64_t)1<<12, req->tosend): std::min((uint64_t)1<<12, complete - req->offset);
+        size_t rd = pread(req->transfer,buf,tosend,req->offset); // FIXME hope it is cached.
         if (rd<0) {
             HttpGwCloseConnection(sink);
             return;
         }
         int wn = send(sink, buf, rd, 0);
         if (wn<0) {
+        	/* That was probably because the browser closed the connection due to
+        	 *  it got enough information to request a more accurate byte range request.
+        	 *  (ex. The browser requests the entire file but when it receives just the metadata
+        	 *   at the beginning of the file, it closes the ongoing connection and requests a specific request)
+        	 */
             print_error("send fails");
             HttpGwCloseConnection(sink);
             return;
@@ -76,11 +87,19 @@ void HttpGwMayWriteCallback (SOCKET sink) {
     } else {
         if (req->tosend==0) { // done; wait for new request
             dprintf("%s @%i done\n",tintstr(),req->id);
-            sckrwecb_t wait_new_req
-            //  (req->sink,HttpGwNewRequestCallback,NULL,HttpGwCloseConnection);
-              (req->sink,NULL,NULL,NULL);
-            HttpGwCloseConnection(sink);
-            swift::Datagram::Listen3rdPartySocket (wait_new_req);
+            /*
+            // Close connection if it reached the end of the file
+            if(req->offset == complete){
+            	sckrwecb_t wait_new_req(req->sink,NULL,NULL,NULL);
+            	HttpGwCloseConnection(sink);
+            	swift::Datagram::Listen3rdPartySocket (wait_new_req);
+            } else{
+            */
+                // Wait for more http requests
+                sckrwecb_t wait_new_req
+                    (req->sink,HttpGwNewRequestCallback,NULL,HttpGwCloseConnection);
+                swift::Datagram::Listen3rdPartySocket(wait_new_req);
+            //}
         } else { // wait for data
             dprintf("%s @%i waiting for data\n",tintstr(),req->id);
             sckrwecb_t wait_swift_data(req->sink,NULL,NULL,HttpGwCloseConnection);
@@ -92,16 +111,18 @@ void HttpGwMayWriteCallback (SOCKET sink) {
 
 void HttpGwSwiftProgressCallback (int transfer, bin64_t bin) {
     dprintf("%s @A pcb: %s\n",tintstr(),bin.str());
-    for (int httpc=0; httpc<http_gw_reqs_open; httpc++)
-        if (http_requests[httpc].transfer==transfer)
-            if ( (bin.base_offset()<<10) <= http_requests[httpc].offset &&
-                  ((bin.base_offset()+bin.width())<<10) > http_requests[httpc].offset  ) {
-                dprintf("%s @%i progress: %s\n",tintstr(),http_requests[httpc].id,bin.str());
+    for (int httpc=0; httpc<http_gw_reqs_open; httpc++) {
+        if (http_requests[httpc].transfer==transfer) {
+           // if ( (bin.base_offset()<<10) <= http_requests[httpc].offset &&
+           //       ((bin.base_offset()+bin.width())<<10) > http_requests[httpc].offset  ) {
+           //     dprintf("%s @%i progress: %s\n",tintstr(),http_requests[httpc].id,bin.str());
                 sckrwecb_t maywrite_callbacks
                         (http_requests[httpc].sink,NULL,
                          HttpGwMayWriteCallback,HttpGwCloseConnection);
                 Datagram::Listen3rdPartySocket (maywrite_callbacks);
-            }
+           // }
+        }
+    }
 }
 
 
@@ -112,44 +133,170 @@ void HttpGwFirstProgressCallback (int transfer, bin64_t bin) {
     swift::AddProgressCallback(transfer,&HttpGwSwiftProgressCallback,0);
     for (int httpc=0; httpc<http_gw_reqs_open; httpc++) {
         http_gw_t * req = http_requests + httpc;
-        if (req->transfer==transfer && req->tosend==0) { // FIXME states
+        //if (req->transfer==transfer && req->tosend==0) { // FIXME states
+		if (req->transfer==transfer) {
             uint64_t file_size = swift::Size(transfer);
             char response[1024];
+
+            // HTTP Partial Content
+            //time_t rawtime;
+            //time(&rawtime);
             sprintf(response,
-                "HTTP/1.1 200 OK\r\n"\
-                "Connection: keep-alive\r\n"\
-                "Content-Type: video/ogg\r\n"\
-                /*"X-Content-Duration: 32\r\n"*/\
+                "HTTP/1.1 206 Partial Content\r\n"\
+                /*"Date: %s\r\n"*/\
+                "Server: Swift-httpgw\r\n"\
+                /*"Last-Modified: %s\r\n"*/\
+                /*"Etag: %s\r\n"*/\
+                "Accept-Ranges: bytes\r\n"\
                 "Content-Length: %lli\r\n"\
-                "Accept-Ranges: none\r\n"\
+                "Content-Range: bytes %lli-%lli/%lli\r\n"\
+                /*"Keep-Alive: timeout=5, max=100\r\n"\*/
+                "Connection: Keep-Alive\r\n"\
+                /* FIXME Content-Type should be calculated (parsing the content or as an URL param */
+                "Content-Type: video/webm\r\n"\
                 "\r\n",
+                //ctime(&rawtime),
+                //ctime(&rawtime),
+                //etag(),
+                /* FIXME file_size is not the real size of the object */
+                req->tosend, // (req->offset == 0) ? file_size : req->tosend,
+                req->offset,
+                req->offset + req->tosend -1, // (req->offset == 0) ? file_size-1 : req->offset + req->tosend -1,
                 file_size);
             send(req->sink,response,strlen(response),0);
-            req->tosend = file_size;
-            dprintf("%s @%i headers_sent size %lli\n",tintstr(),req->id,file_size);
+            dprintf("%s @%i headers_sent size %lli\n",tintstr(),req->id,req->tosend);
         }
     }
-    HttpGwSwiftProgressCallback(transfer,bin);
+	HttpGwSwiftProgressCallback(transfer,bin);
 }
 
 
+// Dispatch a request to get/set attributes from http
+void HttpGwInfoRequest (int transfer, char* attr) {
+
+    for (int httpc=0; httpc<http_gw_reqs_open; httpc++) {
+        http_gw_t * req = http_requests + httpc;
+        //if (req->transfer==transfer && req->tosend==0) { // FIXME states
+		if (req->transfer==transfer) {
+
+        	Sha1Hash root_hash = FileTransfer::file(transfer)->root_hash();
+
+        	swift::PeerList* peerList;
+        	swift::PeerList::iterator it;
+
+        	// Declare the content for the HTTP response
+        	char* content = NULL;
+        	size_t contentSize = 0;
+
+			// Parse the attribute
+			if(strcmp(attr,"peerList") == 0){
+
+				// Return the list of peers for the ongoing stream "ip:port,ip2:port2"
+				// FIXME Return a JSON-like response
+
+				// MaxListSize id the #channels in the file transfer
+				int maxListSize = FileTransfer::file(transfer)->channel_count() * 32;
+				char peerListChar[maxListSize];
+				strcpy(peerListChar, "\0");
+
+				// Call the API to retrieve the list of peers
+				peerList = swift::GetPeers(root_hash);
+
+				for (it = peerList->begin(); it != peerList->end(); it++){
+					// Add a new peer in the string
+					strcat(peerListChar,it->str());
+					//if (it != peerList->end()) {
+						strcat(peerListChar,",");
+					//}
+				}
+				content = peerListChar;
+				contentSize = strlen(peerListChar);
+
+			} else if ((strlen(attr)>6) && strncmp(attr,"peers=",6) == 0) {
+
+				// Set the given peers on the file transfer
+
+				peerList = new PeerList;
+				char *peer = strtok(&attr[6],",");
+
+				// Declare the IP parse parameters
+				const char* format = "%15[0-9.]:%5[0-9]";
+				// FIXME only for IPv4
+				char ip[16] = { 0 };
+				char portCh[6] = { 0 };
+				uint16_t port = 0;
+				// Parse the peer address in string format
+				while (peer){
+					if(sscanf(peer, format, ip, portCh) == 2) {
+						port = atoi(portCh);
+						Address* addr = new Address(ip, port);
+						peerList->push_back(*addr);
+						dprintf("%s New peer from http gw: %s:%d\n", tintstr(), ip, port);
+					}
+					peer = strtok(NULL,",");
+				}
+				swift::AddPeers(peerList, root_hash);
+
+				// FIXME Fake response
+				contentSize = 0;
+			}
+
+			// HTTP response header
+			char response[1024];
+			sprintf(response,
+					"HTTP/1.1 200 OK\r\n"\
+					"Connection: close\r\n"\
+					"Content-Type: text/plain\r\n"\
+					/*"X-Content-Duration: 32\r\n"*/\
+					"Content-Length: %zu\r\n"\
+					"Accept-Ranges: none\r\n"\
+					"\r\n",
+					contentSize);	// FIXME Check this casting
+			send(req->sink,response,strlen(response),0);
+
+			// HTTP info content
+			int wn = send(req->sink, content, contentSize, 0);
+			if (wn<0) {
+				print_error("send fails");
+				HttpGwCloseConnection(req->sink);
+				return;
+			}
+
+			// FIXME Check if Listen3rdPartySocket is needed at the end of this method here
+			HttpGwCloseConnection(req->sink);
+			return;
+        }
+    }
+}
+
 void HttpGwNewRequestCallback (SOCKET http_conn){
-    http_gw_t* req = http_requests + http_gw_reqs_open++;
-    req->id = ++http_gw_reqs_count;
-    req->sink = http_conn;
-    req->offset = 0;
-    req->tosend = 0;
-    dprintf("%s @%i new http request\n",tintstr(),req->id);
+
+	// Add a new request if it is not already in use
+	http_gw_t* req = HttpGwFindRequest(http_conn);
+	if(!req){
+	    req = http_requests + http_gw_reqs_open++;
+	    req->id = ++http_gw_reqs_count;
+	    req->sink = http_conn;
+	    req->offset = 0;
+	    req->tosend = 0;
+	    dprintf("%s @%i new http request\n",tintstr(),req->id);
+	}
     // read headers - the thrilling part
     // we surely do not support pipelining => one request at a time
     #define HTTPGW_MAX_REQ_SIZE 1024
     char buf[HTTPGW_MAX_REQ_SIZE+1];
     int rd = recv(http_conn,buf,HTTPGW_MAX_REQ_SIZE,0);
-    if (rd<=0) { // if conn is closed by the peer, rd==0
-        HttpGwCloseConnection(http_conn);
+    if (rd<=0) { // if conn is closed by the peer or no more requests, rd==0
+        //sckrwecb_t wait_new_req(http_conn,NULL,NULL,NULL);
+		HttpGwCloseConnection(http_conn);
+		//swift::Datagram::Listen3rdPartySocket (wait_new_req);
         return;
     }
     buf[rd] = 0;
+
+    // Check HTTP request
+    dprintf("%s\n", buf);
+
     // HTTP request line
     char* reqline = strtok(buf,"\r\n");
     char method[16], url[512], version[16], crlf[5];
@@ -157,6 +304,7 @@ void HttpGwNewRequestCallback (SOCKET http_conn){
         HttpGwCloseConnection(http_conn);
         return;
     }
+
     // HTTP header fields
     char* headerline;
     while (headerline=strtok(NULL,"\n\r")) {
@@ -165,32 +313,106 @@ void HttpGwNewRequestCallback (SOCKET http_conn){
             HttpGwCloseConnection(http_conn);
             return;
         }
-        for(int i=0; i<HTTPGW_MAX_HEADER; i++)
-            if (0==strcasecmp(HTTPGW_HEADERS[i],header) && !req->headers[i])
+
+        //dprintf("%s\n", headerline);
+
+        // Copy the header in req
+        for(int i=0; i<HTTPGW_MAX_HEADER; i++) {
+        	// FIXME We only check here the Range header
+            if (0==strcasecmp(HTTPGW_HEADERS[i],header)){ // && !req->headers[i]) {
                 req->headers[i] = strdup(value);
+            }
+        }
     }
+
     // parse URL
-    char * hashch=strtok(url,"/"), hash[41];
-    while (hashch && (1!=sscanf(hashch,"%40[0123456789abcdefABCDEF]",hash) || strlen(hash)!=40))
-        hashch = strtok(NULL,"/");
-    if (strlen(hash)!=40) {
-        HttpGwCloseConnection(http_conn);
-        return;
-    }
-    dprintf("%s @%i demands %s\n",tintstr(),req->id,hash);
-    // initiate transmission
-    Sha1Hash root_hash = Sha1Hash(true,hash);
-    int file = swift::Find(root_hash);
-    if (file==-1)
-        file = swift::Open(hash,root_hash);
-    req->transfer = file;
-    if (swift::Size(file)) {
-        HttpGwFirstProgressCallback(file,bin64_t(0,0));
-    } else {
-        swift::AddProgressCallback(file,&HttpGwFirstProgressCallback,0);
-        sckrwecb_t install (http_conn,NULL,NULL,HttpGwCloseConnection);
-        swift::Datagram::Listen3rdPartySocket(install);
-    }
+     char * hashch=strtok(url,"/"), hash[41];
+     while (hashch && (1!=sscanf(hashch,"%40[0123456789abcdefABCDEF]",hash) || strlen(hash)!=40))
+         hashch = strtok(NULL,"/");
+     if (strlen(hash)!=40) {
+         HttpGwCloseConnection(http_conn);
+         return;
+     }
+
+     Sha1Hash root_hash = Sha1Hash(true,hash);
+
+     // Check if there is an additional attribute in the URL
+ 	char *attr = (url[41]=='?') ? &url[42] : NULL;
+
+     int file = swift::Find(root_hash);
+     // FIXME If an attribute is given, the file transfer should be initiated
+     if (file==-1 && !attr)
+         file = swift::Open(hash,root_hash);
+     req->transfer = file;
+
+    // Set the offset and size of the content range based on the Content header
+	if(req->headers[0]) {
+
+		int start = 0, end = 0;
+
+		// FIXME 32 digits offset size
+		int params = sscanf(req->headers[0],"bytes=%d-%d",&start,&end);
+		if(params == 0){
+			HttpGwCloseConnection(http_conn);
+			return;
+		}
+
+		//dprintf("start: %d, end: %d\n", start, end);
+
+		uint64_t file_size = swift::Size(file);
+
+		if(start == 0){
+			start = 0;
+		}
+		req->offset = start;
+
+		if(end == 0){
+			end = file_size - 1;
+		}
+
+		// FIXME Check the equal condition
+		if(req->offset <= end){
+			req->tosend = end - req->offset + 1;
+		}
+
+		/*
+		 * Optimistic approach: if the browser requests the entire file, send the content
+		 *  hoping that the browser would close the connection when it will parse the metadata
+		 *  at the beginning of the file. Then, the browser should request a specific range byte request.
+		 *
+		 * Pessimistic approach (commented): if the browser requests the entire file,
+		 *  send and initial range from the beginning. Then, the browser should request a range byte request.
+		 */
+		/*
+        // FIXME Not working for Chrome and Safari. It seems they don't request ranges
+        if(req->tosend == file_size){
+        	req->tosend = 20480;	// FIXME Magic number for metadata?
+        	req->offset = 0;
+        }
+        */
+
+	}
+
+	if(attr){
+		// The request is not interested in content, only metadata
+		if(file!=-1){
+			HttpGwInfoRequest(file, attr);
+		} else {
+			// Attributes are only valid for ongoing file transfers
+			HttpGwCloseConnection(http_conn);
+			return;
+		}
+	}else{
+		// Perform the range request
+		dprintf("%s @%i demands %s\n",tintstr(),req->id,hash);
+	    if (swift::Size(file)) {
+	        HttpGwFirstProgressCallback(file,bin64_t(0,0));
+	    } else {
+	        swift::AddProgressCallback(file,&HttpGwFirstProgressCallback,0);
+	        sckrwecb_t install (http_conn,NULL,NULL,HttpGwCloseConnection);
+	        swift::Datagram::Listen3rdPartySocket(install);
+	    }
+	}
 }
 
 
@@ -198,6 +420,7 @@ void HttpGwNewRequestCallback (SOCKET http_conn){
 void HttpGwNewConnectionCallback (SOCKET serv) {
     Address client_address;
     socklen_t len;
+    // FIXME allow http persistent connections
     SOCKET conn = accept (serv, (sockaddr*) & (client_address.addr), &len);
     if (conn==INVALID_SOCKET) {
         print_error("client conn fails");

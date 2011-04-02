@@ -21,7 +21,7 @@ std::vector<FileTransfer*> FileTransfer::files(20);
 
 // FIXME: separate Bootstrap() and Download(), then Size(), Progress(), SeqProgress()
 
-FileTransfer::FileTransfer (const char* filename, const Sha1Hash& _root_hash) :
+FileTransfer::FileTransfer (const char* filename, const Sha1Hash& _root_hash, uint64_t range) :
     file_(filename,_root_hash), hs_in_offset_(0), cb_installed(0)
 {
     if (files.size()<fd()+1)

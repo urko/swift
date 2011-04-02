@@ -83,6 +83,7 @@ namespace swift {
     typedef std::deque<tintbin> tbqueue;
     typedef std::deque<bin64_t> binqueue;
     typedef Address   Address;
+    typedef std::vector<Address> PeerList;
 
     /** A heap (priority queue) for timestamped bin numbers (tintbins). */
     class tbheap {
@@ -135,7 +136,7 @@ namespace swift {
          *  @param file_name    the name of the file
          *  @param root_hash    the root hash of the file; zero hash if the file
                                 is newly submitted */
-        FileTransfer(const char *file_name, const Sha1Hash& root_hash=Sha1Hash::ZERO);
+        FileTransfer(const char *file_name, const Sha1Hash& root_hash=Sha1Hash::ZERO, uint64_t range=bin64_t::ALL);
 
         /**    Close everything. */
         ~FileTransfer();
@@ -201,7 +202,7 @@ namespace swift {
         friend bool      IsComplete (int fdes);
         friend uint64_t  Complete (int fdes);
         friend uint64_t  SeqComplete (int fdes);
-        friend int     Open (const char* filename, const Sha1Hash& hash) ;
+        friend int     Open (const char* filename, const Sha1Hash& hash, uint64_t range);
         friend void    Close (int fd) ;
         friend void AddProgressCallback (int transfer,ProgressCallback cb,uint8_t agg);
         friend void RemoveProgressCallback (int transfer,ProgressCallback cb);
@@ -217,7 +218,7 @@ namespace swift {
     public:
         virtual void Randomize (uint64_t twist) = 0;
         /** The piece picking method itself.
-         *  @param  offered     the daata acknowledged by the peer
+         *  @param  offered     the data acknowledged by the peer
          *  @param  max_width   maximum number of packets to ask for
          *  @param  expires     (not used currently) when to consider request expired
          *  @return             the bin number to request */
@@ -230,7 +231,9 @@ namespace swift {
     class PeerSelector {
     public:
         virtual void AddPeer (const Address& addr, const Sha1Hash& root) = 0;
-        virtual Address GetPeer (const Sha1Hash& for_root) = 0;
+        virtual void AddPeers (PeerList* peerList, const Sha1Hash& root) = 0;
+        virtual Address* GetPeer (const Sha1Hash& for_root) = 0;
+        virtual PeerList* GetPeers (const Sha1Hash& for_root) = 0;
     };
 
 
@@ -322,6 +325,7 @@ namespace swift {
 
         static int  DecodeID(int scrambled);
         static int  EncodeID(int unscrambled);
+        static int Nchannels() { return channels.size(); }
         static Channel* channel(int i) {
             return i<channels.size()?channels[i]:NULL;
         }
@@ -413,9 +417,13 @@ namespace swift {
 
         friend int      Listen (Address addr);
         friend void     Shutdown (int sock_des);
-        friend void     AddPeer (Address address, const Sha1Hash& root);
+        friend void     AddPeer (const Address& address, const Sha1Hash& root);
+        friend void		AddPeers (PeerList* peerList, const Sha1Hash& root);
+        friend Address*	GetPeer (const Sha1Hash& for_root);
+        friend PeerList* GetPeers (const Sha1Hash& for_root);
+        friend uint64_t GetOffset(const Sha1Hash& for_root);
         friend void     SetTracker(const Address& tracker);
-        friend int      Open (const char*, const Sha1Hash&) ; // FIXME
+        friend int      Open (const char*, const Sha1Hash&, uint64_t range) ; // FIXME
 
     };
 
@@ -431,8 +439,9 @@ namespace swift {
     void    Shutdown (int sock_des=-1);
 
     /** Open a file, start a transmission; fill it with content for a given root hash;
-        in case the hash is omitted, the file is a fresh submit. */
-    int     Open (const char* filename, const Sha1Hash& hash=Sha1Hash::ZERO) ;
+        in case the hash is omitted, the file is a fresh submit.
+        The optional parameter sets the initial range to begin the transmission */
+    int     Open (const char* filename, const Sha1Hash& hash=Sha1Hash::ZERO, uint64_t range=bin64_t::ALL);
     /** Get the root hash for the transmission. */
     const Sha1Hash& RootMerkleHash (int file) ;
     /** Close a file and a transmission. */
@@ -440,7 +449,28 @@ namespace swift {
     /** Add a possible peer which participares in a given transmission. In the case
         root hash is zero, the peer might be talked to regarding any transmission
         (likely, a tracker, cache or an archive). */
-    void    AddPeer (Address address, const Sha1Hash& root=Sha1Hash::ZERO);
+    void    AddPeer (const Address& address, const Sha1Hash& root=Sha1Hash::ZERO);
+
+    /**
+     * Add a list of peers for the given root hash.
+     */
+    void AddPeers (PeerList* peerList, const Sha1Hash& root);
+
+    /**
+     * Return a current peer of the given root hash.
+     */
+    Address* GetPeer (const Sha1Hash& for_root);
+
+    /**
+     * Return the addresses of the current peers given a root hash.
+     * Don't forget to free this list when it will not be used!.
+     */
+    PeerList* GetPeers (const Sha1Hash& for_root);
+
+    /**
+     * Get the bin's offset in base units of the last data received.
+     */
+    //uint64_t GetOffset(const Sha1Hash& for_root);
 
     void    SetTracker(const Address& tracker);
 
