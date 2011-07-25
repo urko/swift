@@ -41,11 +41,12 @@ void HttpGwCloseConnection (SOCKET sock) {
     http_gw_t* req = HttpGwFindRequest(sock);
     if (req) {
         dprintf("%s @%i closed http connection %i\n",tintstr(),req->id,sock);
-        for(int i=0; i<HTTPGW_MAX_HEADER; i++)
+        for(int i=0; i<HTTPGW_MAX_HEADER; i++) {
             if (req->headers[i]) {
                 free(req->headers[i]);
                 req->headers[i] = NULL;
             }
+        }
         *req = http_requests[--http_gw_reqs_open];
     }
     swift::close_socket(sock);
@@ -72,8 +73,8 @@ void HttpGwMayWriteCallback (SOCKET sink) {
         }
         int wn = send(sink, buf, rd, 0);
         if (wn<0) {
-        	/* That was probably because the browser closed the connection due to
-        	 *  it got enough information to request a more accurate byte range request.
+        	/* Probably because the user agent (browser) closed the connection due to
+        	 *  it got enough info to request another byte range request.
         	 *  (ex. The browser requests the entire file but when it receives just the metadata
         	 *   at the beginning of the file, it closes the ongoing connection and requests a specific request)
         	 */
@@ -84,27 +85,16 @@ void HttpGwMayWriteCallback (SOCKET sink) {
         dprintf("%s @%i sent %ib\n",tintstr(),req->id,(int)wn);
         req->offset += wn;
         req->tosend -= wn;
-    } else {
-        if (req->tosend==0) { // done; wait for new request
-            dprintf("%s @%i done\n",tintstr(),req->id);
-            /*
-            // Close connection if it reached the end of the file
-            if(req->offset == complete){
-            	sckrwecb_t wait_new_req(req->sink,NULL,NULL,NULL);
-            	HttpGwCloseConnection(sink);
-            	swift::Datagram::Listen3rdPartySocket (wait_new_req);
-            } else{
-            */
-                // Wait for more http requests
-                sckrwecb_t wait_new_req
-                    (req->sink,HttpGwNewRequestCallback,NULL,HttpGwCloseConnection);
-                swift::Datagram::Listen3rdPartySocket(wait_new_req);
-            //}
-        } else { // wait for data
-            dprintf("%s @%i waiting for data\n",tintstr(),req->id);
-            sckrwecb_t wait_swift_data(req->sink,NULL,NULL,HttpGwCloseConnection);
-            swift::Datagram::Listen3rdPartySocket(wait_swift_data);
-        }
+    } else if (req->offset==complete) {
+		dprintf("%s @%i done\n",tintstr(),req->id);
+		// Close connection if it reaches EOF
+		sckrwecb_t wait_new_req(req->sink,NULL,NULL,NULL);
+		HttpGwCloseConnection(sink);
+		swift::Datagram::Listen3rdPartySocket (wait_new_req);
+	} else { // wait for data
+		dprintf("%s @%i waiting for data\n",tintstr(),req->id);
+		sckrwecb_t wait_swift_data(req->sink,NULL,NULL,HttpGwCloseConnection);
+		swift::Datagram::Listen3rdPartySocket(wait_swift_data);
     }
 }
 
@@ -133,38 +123,80 @@ void HttpGwFirstProgressCallback (int transfer, bin64_t bin) {
     swift::AddProgressCallback(transfer,&HttpGwSwiftProgressCallback,0);
     for (int httpc=0; httpc<http_gw_reqs_open; httpc++) {
         http_gw_t * req = http_requests + httpc;
-        //if (req->transfer==transfer && req->tosend==0) { // FIXME states
 		if (req->transfer==transfer) {
-            uint64_t file_size = swift::Size(transfer);
-            char response[1024];
+			uint64_t file_size = swift::Size(transfer);
+			char response[1024];
 
-            // HTTP Partial Content
-            //time_t rawtime;
-            //time(&rawtime);
-            sprintf(response,
-                "HTTP/1.1 206 Partial Content\r\n"\
-                /*"Date: %s\r\n"*/\
-                "Server: Swift-httpgw\r\n"\
-                /*"Last-Modified: %s\r\n"*/\
-                /*"Etag: %s\r\n"*/\
-                "Accept-Ranges: bytes\r\n"\
-                "Content-Length: %lli\r\n"\
-                "Content-Range: bytes %lli-%lli/%lli\r\n"\
-                /*"Keep-Alive: timeout=5, max=100\r\n"\*/
-                "Connection: Keep-Alive\r\n"\
-                /* FIXME Content-Type should be calculated (parsing the content or as an URL param */
-                "Content-Type: video/webm\r\n"\
-                "\r\n",
-                //ctime(&rawtime),
-                //ctime(&rawtime),
-                //etag(),
-                /* FIXME file_size is not the real size of the object */
-                req->tosend, // (req->offset == 0) ? file_size : req->tosend,
-                req->offset,
-                req->offset + req->tosend -1, // (req->offset == 0) ? file_size-1 : req->offset + req->tosend -1,
-                file_size);
+            // Parse parameters of byte range
+            if (req->headers[0]) {
+
+            	int end = file_size - 1, params = 0;
+
+            	// Scan the http range header
+				params = sscanf(req->headers[0],"bytes=%d-%d",(int*)&req->offset,&end);
+				if(params == 0){
+					HttpGwCloseConnection(req->sink);
+					return;
+				}
+
+				// FIXME Check the equal condition for some cases
+				if((int)req->offset <= end){
+					req->tosend = end - req->offset + 1;
+				}
+
+				/*
+				 * Optimistic approach: if the user agent (browser) requests the entire file, send the content
+				 *  hoping the browser would close the connection, when parsing metadata
+				 *  (usually at the beginning of the file). Then, the browser should request a specific range byte request.
+				 *  It seems to work in Firefox and Opera. Partially in Chrome depending on the how the codec
+				 *  is used.
+				 *
+				 * Pessimistic approach (commented): if the browser requests the entire file,
+				 *  send and initial range from the beginning. Then, the browser should request a range byte request.
+				 */
+				/*
+				if(req->tosend == file_size){
+					req->tosend = 20480;	// FIXME Magic number for metadata?
+					req->offset = 0;
+				}
+				*/
+
+				// HTTP Partial Content
+				//time_t rawtime;
+				//time(&rawtime);
+				sprintf(response,
+					"HTTP/1.1 206 Partial Content\r\n"\
+					"Server: Swift-httpgw\r\n"\
+					"ETag: 204f6-bba79a-39256b00\r\n"\
+					"Accept-Ranges: bytes\r\n"\
+					"Content-Length: %lli\r\n"\
+					"Content-Range: bytes %lli-%lli/%lli\r\n"\
+					"Connection: Keep-Alive\r\n"\
+					/* FIXME Content-Type should be calculated (parsing the content or as an URL param */
+					"Content-Type: video/webm\r\n"\
+					"\r\n",
+					/* FIXME file_size is not the real size of the object */
+					req->tosend, // (req->offset == 0) ? file_size : req->tosend,
+					req->offset,
+					req->offset + req->tosend -1, // (req->offset == 0) ? file_size-1 : req->offset + req->tosend -1,
+					file_size);
+
+			} else {
+				// The browser does not send a range http header. Request entire file
+				req->tosend = file_size;
+            	sprintf(response,
+					"HTTP/1.1 200 OK\r\n"\
+					"Server: Swift-httpgw\r\n"\
+					"Accept-Ranges: bytes\r\n"\
+					"Connection: keep-alive\r\n"\
+					"Content-Type: video/webm\r\n"\
+					"Content-Length: %lli\r\n"\
+					"\r\n", req->tosend);
+			}
+
+			dprintf("%s", response);
             send(req->sink,response,strlen(response),0);
-            dprintf("%s @%i headers_sent size %lli\n",tintstr(),req->id,req->tosend);
+			dprintf("%s @%i headers_sent size %lli\n",tintstr(),req->id,req->tosend);
         }
     }
 	HttpGwSwiftProgressCallback(transfer,bin);
@@ -172,53 +204,73 @@ void HttpGwFirstProgressCallback (int transfer, bin64_t bin) {
 
 
 // Dispatch a request to get/set attributes from http
-void HttpGwInfoRequest (int transfer, char* attr) {
+void HttpGwInfoRequest (int transfer, char* attrR) {
 
     for (int httpc=0; httpc<http_gw_reqs_open; httpc++) {
         http_gw_t * req = http_requests + httpc;
-        //if (req->transfer==transfer && req->tosend==0) { // FIXME states
-		if (req->transfer==transfer) {
+        // Check if the socket belongs to the current info request.
+        // There could be different requests through the same socket concurrently
+		if ((req->transfer==transfer) &&
+				(req->headers[0] == attrR)) {
+			// Restore header for request
+			req->headers[0] = NULL;
+			// Point to request msg
+			char * attr = &attrR[1];
 
         	Sha1Hash root_hash = FileTransfer::file(transfer)->root_hash();
 
         	swift::PeerList* peerList;
         	swift::PeerList::iterator it;
+        	// Call the API to retrieve the list of peers
+        	peerList = swift::GetPeers(root_hash);
 
         	// Declare the content for the HTTP response
         	char* content = NULL;
         	size_t contentSize = 0;
 
-			// Parse the attribute
-			if(strcmp(attr,"peerList") == 0){
+        	char callback[100];
 
-				// Return the list of peers for the ongoing stream "ip:port,ip2:port2"
-				// FIXME Return a JSON-like response
+			// Parse the attribute
+			if(strncmp(attr,"info&", 5) == 0){
+				// Getter: return the protocol version and the list of peers
+				//			for the ongoing stream "ip:port,ip2:port2"
 
 				// MaxListSize id the #channels in the file transfer
 				int maxListSize = FileTransfer::file(transfer)->channel_count() * 32;
 				char peerListChar[maxListSize];
 				strcpy(peerListChar, "\0");
 
-				// Call the API to retrieve the list of peers
-				peerList = swift::GetPeers(root_hash);
-
-				for (it = peerList->begin(); it != peerList->end(); it++){
+				// FIXME Write a better JSON wrapper
+				strcat(peerListChar,"\x5B");
+				for (it = peerList->begin(); it < peerList->end(); it++){
 					// Add a new peer in the string
-					strcat(peerListChar,it->str());
-					//if (it != peerList->end()) {
+					if (it != peerList->begin()) {
 						strcat(peerListChar,",");
-					//}
+					}
+					strcat(peerListChar, "\"");
+					strcat(peerListChar,it->str());
+					strcat(peerListChar, "\"");
 				}
-				content = peerListChar;
-				contentSize = strlen(peerListChar);
+				strcat(peerListChar,"\x5D");
 
-			} else if ((strlen(attr)>6) && strncmp(attr,"peers=",6) == 0) {
+				// If a callback is given, wrap the list in a function
+				if (strncmp(attr,"info&callback=",14) == 0){
+					sprintf(callback, "%s({\"protocol\": %s, \"info\": %s});",
+							&attr[14], "\"swift\"", peerListChar);
+					content = callback;
+				} else {
+					content = peerListChar;
+				}
+				dprintf("info: %s\n", content);
+				contentSize = strlen(content);
+				//contentSize = strlen(peerListChar);
 
-				// Set the given peers on the file transfer
+			} else if ((strlen(attr)>5) && strncmp(attr,"info=",5) == 0) {
+				// Setter: update the given peers on the file transfer
 
-				peerList = new PeerList;
-				char *peer = strtok(&attr[6],",");
+				swift::PeerList* newPeerList = new PeerList;
 
+				char *peer = strtok(&attr[5],",");
 				// Declare the IP parse parameters
 				const char* format = "%15[0-9.]:%5[0-9]";
 				// FIXME only for IPv4
@@ -227,39 +279,52 @@ void HttpGwInfoRequest (int transfer, char* attr) {
 				uint16_t port = 0;
 				// Parse the peer address in string format
 				while (peer){
-					if(sscanf(peer, format, ip, portCh) == 2) {
+					bool added = false;
+					// Check if the peers is already added
+					for (it = peerList->begin(); it < peerList->end(); it++){
+						if (strcmp(it->str(), peer) == 0) {
+							added = true;
+							dprintf("Peer %s already on the peer list\n", peer);
+						}
+					}
+					if(!added && sscanf(peer, format, ip, portCh) == 2) {
+						// Add the peer on the list
 						port = atoi(portCh);
 						Address* addr = new Address(ip, port);
-						peerList->push_back(*addr);
+						newPeerList->push_back(*addr);
 						dprintf("%s New peer from http gw: %s:%d\n", tintstr(), ip, port);
 					}
 					peer = strtok(NULL,",");
 				}
-				swift::AddPeers(peerList, root_hash);
+				if (!newPeerList->empty()) {
+					swift::AddPeers(newPeerList, root_hash);
+				}
 
-				// FIXME Fake response
-				contentSize = 0;
+				// Ack http response
+				sprintf(callback, "console.log(\"info ok\")");
+				content = callback;
+				contentSize = strlen(content);
 			}
 
 			// HTTP response header
 			char response[1024];
 			sprintf(response,
 					"HTTP/1.1 200 OK\r\n"\
-					"Connection: close\r\n"\
-					"Content-Type: text/plain\r\n"\
-					/*"X-Content-Duration: 32\r\n"*/\
-					"Content-Length: %zu\r\n"\
-					"Accept-Ranges: none\r\n"\
-					"\r\n",
-					contentSize);	// FIXME Check this casting
+					"Connection: keep-alive\r\n"\
+					"Content-Type: application/javascript\r\n"\
+					"\r\n");
+			dprintf("%s", response);
 			send(req->sink,response,strlen(response),0);
 
 			// HTTP info content
-			int wn = send(req->sink, content, contentSize, 0);
-			if (wn<0) {
-				print_error("send fails");
-				HttpGwCloseConnection(req->sink);
-				return;
+			// FIXME Resource temporally unavailable appears rarely
+			if (contentSize > 0) {
+				int wn = send(req->sink, content, contentSize, 0);
+				if (wn<0) {
+					print_error("send fails");
+					HttpGwCloseConnection(req->sink);
+					return;
+				}
 			}
 
 			// FIXME Check if Listen3rdPartySocket is needed at the end of this method here
@@ -279,6 +344,9 @@ void HttpGwNewRequestCallback (SOCKET http_conn){
 	    req->sink = http_conn;
 	    req->offset = 0;
 	    req->tosend = 0;
+	    for(int i=0; i<HTTPGW_MAX_HEADER; i++) {
+			req->headers[i] = NULL;
+	    }
 	    dprintf("%s @%i new http request\n",tintstr(),req->id);
 	}
     // read headers - the thrilling part
@@ -307,23 +375,23 @@ void HttpGwNewRequestCallback (SOCKET http_conn){
 
     // HTTP header fields
     char* headerline;
-    while (headerline=strtok(NULL,"\n\r")) {
+    while (headerline=strtok(NULL,"\r\n")) {
         char header[128], value[256];
         if (2!=sscanf(headerline,"%120[^: ]: %250[^\r\n]",header,value)) {
             HttpGwCloseConnection(http_conn);
             return;
         }
 
-        //dprintf("%s\n", headerline);
-
         // Copy the header in req
         for(int i=0; i<HTTPGW_MAX_HEADER; i++) {
-        	// FIXME We only check here the Range header
             if (0==strcasecmp(HTTPGW_HEADERS[i],header)){ // && !req->headers[i]) {
                 req->headers[i] = strdup(value);
             }
         }
     }
+
+    // Check if there is an additional attribute in the URL
+	char * attr = strchr(url, '?'); //(url[41]=='?') ? &url[42] : NULL;
 
     // parse URL
      char * hashch=strtok(url,"/"), hash[41];
@@ -336,66 +404,17 @@ void HttpGwNewRequestCallback (SOCKET http_conn){
 
      Sha1Hash root_hash = Sha1Hash(true,hash);
 
-     // Check if there is an additional attribute in the URL
- 	char *attr = (url[41]=='?') ? &url[42] : NULL;
-
      int file = swift::Find(root_hash);
      // FIXME If an attribute is given, the file transfer should be initiated
      if (file==-1 && !attr)
          file = swift::Open(hash,root_hash);
      req->transfer = file;
 
-    // Set the offset and size of the content range based on the Content header
-	if(req->headers[0]) {
-
-		int start = 0, end = 0;
-
-		// FIXME 32 digits offset size
-		int params = sscanf(req->headers[0],"bytes=%d-%d",&start,&end);
-		if(params == 0){
-			HttpGwCloseConnection(http_conn);
-			return;
-		}
-
-		//dprintf("start: %d, end: %d\n", start, end);
-
-		uint64_t file_size = swift::Size(file);
-
-		if(start == 0){
-			start = 0;
-		}
-		req->offset = start;
-
-		if(end == 0){
-			end = file_size - 1;
-		}
-
-		// FIXME Check the equal condition
-		if(req->offset <= end){
-			req->tosend = end - req->offset + 1;
-		}
-
-		/*
-		 * Optimistic approach: if the browser requests the entire file, send the content
-		 *  hoping that the browser would close the connection when it will parse the metadata
-		 *  at the beginning of the file. Then, the browser should request a specific range byte request.
-		 *
-		 * Pessimistic approach (commented): if the browser requests the entire file,
-		 *  send and initial range from the beginning. Then, the browser should request a range byte request.
-		 */
-		/*
-        // FIXME Not working for Chrome and Safari. It seems they don't request ranges
-        if(req->tosend == file_size){
-        	req->tosend = 20480;	// FIXME Magic number for metadata?
-        	req->offset = 0;
-        }
-        */
-
-	}
-
 	if(attr){
 		// The request is not interested in content, only metadata
 		if(file!=-1){
+			// Detect request info in header when parsing at InfoRequest
+			req->headers[0] = attr;
 			HttpGwInfoRequest(file, attr);
 		} else {
 			// Attributes are only valid for ongoing file transfers

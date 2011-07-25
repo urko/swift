@@ -32,12 +32,13 @@ see doc/index.html for marketing stuff, ideas and rants
     If you use an HTML5 browser (Chrome preferred), you are likely to see
     the bunny trailer at this point...
     
-    On the other hand, you can also play with queries using the swift-HTTP gateway:
+    On the other hand, you can also request/update info using the swift-HTTP gateway:
     
-    	http://localhost:port/rootHash?peerList
+    	http://localhost:port/rootHash?info&callback=function
     	
-	...return a list of peers using a plain-text format "ip:port,ip2:port2".
+	...the function will be called with Swift information as argument in JSON format,
+	   such as the list of peers. function({"protocol": "swift", "info": "ip:port,ip2:port2"}).
 	
-		http://localhost:port/rootHash?peers=ip:port,ip2:port2
+		http://localhost:port/rootHash?info=ip:port,ip2:port2
 		
 	...add peers on the transfer file associated with the given root hash.
